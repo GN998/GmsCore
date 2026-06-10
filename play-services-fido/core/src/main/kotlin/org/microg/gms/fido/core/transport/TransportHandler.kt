@@ -15,6 +15,9 @@ import com.google.android.gms.fido.fido2.api.common.ResidentKeyRequirement.*
 import com.google.android.gms.fido.fido2.api.common.UserVerificationRequirement.*
 import com.upokecenter.cbor.CBORObject
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import org.microg.gms.fido.core.*
 import org.microg.gms.fido.core.protocol.*
 import org.microg.gms.fido.core.protocol.CoseKey.Companion.toByteArray
@@ -266,6 +269,7 @@ abstract class TransportHandler(val transport: Transport, val callback: Transpor
 
     private suspend fun ctap2sign(
         connection: CtapConnection,
+        context: Context,
         options: RequestOptions,
         clientDataHash: ByteArray,
         requireUserVerification: Boolean,
@@ -305,8 +309,116 @@ abstract class TransportHandler(val transport: Transport, val callback: Transpor
             pinHashEnc,
             pinProtocol
         )
+
+        // Construct allowed RP ID Hash set (including AppID extension if present for backwards compatibility)
+        val expectedRpIdHashes = mutableListOf(options.rpId.toByteArray().digest("SHA-256"))
+        options.authenticationExtensions?.fidoAppIdExtension?.appId?.let { appId ->
+            expectedRpIdHashes.add(appId.toByteArray().digest("SHA-256"))
+        }
+
+        fun isExpectedRpIdHash(authData: ByteArray): Boolean {
+            return runCatching {
+                val decoded = AuthenticatorData.decode(authData)
+                expectedRpIdHashes.any { decoded.rpIdHash.contentEquals(it) }
+            }.getOrDefault(false)
+        }
+
         val ctap2Response = connection.runCommand(AuthenticatorGetAssertionCommand(request))
-        return ctap2Response to ctap2Response.credential?.id
+
+        // Validate first assertion's RP ID Hash
+        val responses = mutableListOf<AuthenticatorGetAssertionResponse>()
+        if (isExpectedRpIdHash(ctap2Response.authData)) {
+            responses.add(ctap2Response)
+        } else {
+            Log.w(TAG, "First assertion RP ID hash mismatch, ignoring.")
+        }
+
+        // Loop to fetch remaining credentials if numberOfCredentials > 1
+        val numCredentials = ctap2Response.numberOfCredentials ?: 1
+        if (numCredentials > 1) {
+            // Limit maximum fetches to prevent OOM or infinite loops
+            val maxCredentials = kotlin.math.min(numCredentials, 50)
+            for (i in 1 until maxCredentials) {
+                try {
+                    val nextAssertion = connection.runCommand(AuthenticatorGetNextAssertionCommand())
+                    // Validate subsequent assertion's RP ID Hash
+                    if (isExpectedRpIdHash(nextAssertion.authData)) {
+                        responses.add(nextAssertion)
+                    } else {
+                        Log.w(TAG, "Next assertion RP ID hash mismatch, skipping credential.")
+                    }
+                } catch (e: java.io.IOException) {
+                    Log.w(TAG, "Connection lost during credential pagination, throwing", e)
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Other exception during credential pagination, breaking", e)
+                    break
+                }
+            }
+        }
+
+        if (responses.isEmpty()) {
+            throw RequestHandlingException(ErrorCode.NOT_ALLOWED_ERR, "No valid credentials found for current RP ID")
+        }
+
+        // Display an account chooser dialog if multiple credentials exist
+        if (responses.size > 1) {
+            return suspendCancellableCoroutine { cont ->
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    if (!cont.isActive) return@post
+
+                    val activity = context as? android.app.Activity
+                    if (activity == null || activity.isFinishing || activity.isDestroyed) {
+                        if (cont.isActive) {
+                            cont.resumeWithException(
+                                RequestHandlingException(ErrorCode.UNKNOWN_ERR, "Activity is no longer valid for UI")
+                            )
+                        }
+                        return@post
+                    }
+
+                    val names = responses.map { 
+                        it.user?.displayName?.takeIf { s -> s.isNotBlank() } ?: 
+                        it.user?.name?.takeIf { s -> s.isNotBlank() } ?: 
+                        context.getString(R.string.fido_sign_in_selection_description)
+                    }.toTypedArray()
+
+                    val dialog = android.app.AlertDialog.Builder(activity)
+                        .setTitle(context.getString(R.string.fido_sign_in_selection_title))
+                        .setItems(names) { _, which ->
+                            if (cont.isActive) {
+                                val selected = responses[which]
+                                cont.resume(selected to selected.credential?.id)
+                            }
+                        }
+                        .setOnCancelListener {
+                            if (cont.isActive) {
+                                cont.resumeWithException(RequestHandlingException(ErrorCode.NOT_ALLOWED_ERR, "User canceled"))
+                            }
+                        }
+                        .create()
+
+                    cont.invokeOnCancellation {
+                        android.os.Handler(android.os.Looper.getMainLooper()).post {
+                            runCatching { dialog.dismiss() }
+                        }
+                    }
+
+                    try {
+                        dialog.show()
+                    } catch (e: Exception) {
+                        if (cont.isActive) {
+                            cont.resumeWithException(
+                                RequestHandlingException(ErrorCode.UNKNOWN_ERR, "Unable to show account chooser: ${e.message}")
+                            )
+                        }
+                    }
+                }
+            }
+        }
+            
+        val firstSelected = responses.first()
+        return firstSelected to firstSelected.credential?.id
     }
 
     @RequiresApi(23)
@@ -472,7 +584,7 @@ abstract class TransportHandler(val transport: Transport, val callback: Transpor
 
                     // Authenticators seem to give a response even without a PIN token, so we'll allow
                     // the client to call this even without having a PIN token set
-                    ctap2sign(connection, options, clientDataHash, requireUserVerification, pinToken)
+                    ctap2sign(connection, context, options, clientDataHash, requireUserVerification, pinToken)
                 } catch (e: Ctap2StatusException) {
                     if (e.status == 0x31.toByte()) {
                         throw WrongPinException()
