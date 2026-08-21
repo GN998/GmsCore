@@ -78,9 +78,9 @@ fun buildWebSocketConnectUrl(domainId: Int, routingId: ByteArray, tunnelId: Byte
     append(tunnelId.hex())
 }
 
-fun buildWebSocketNewUrl(tunnelId: ByteArray) = buildString {
+fun buildWebSocketNewUrl(tunnelId: ByteArray, domainId: Int = 0) = buildString {
     append("wss://")
-    append(generateDomain(0))
+    append(generateDomain(domainId))
     append("/cable/new/")
     append(tunnelId.hex())
 }

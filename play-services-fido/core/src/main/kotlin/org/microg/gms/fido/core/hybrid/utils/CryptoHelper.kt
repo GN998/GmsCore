@@ -167,7 +167,7 @@ object CryptoHelper {
         return eid
     }
 
-    fun generatedSeed(routingId: ByteArray): ByteArray {
+    fun generatedSeed(routingId: ByteArray, domainId: Int = 267): ByteArray {
         val seed = ByteArray(16).apply {
             this[0] = 0x00
             val timestamp = System.currentTimeMillis()
@@ -175,8 +175,8 @@ object CryptoHelper {
             buffer.putLong(timestamp)
             System.arraycopy(buffer.array(), 0, this, 1, 8)
             System.arraycopy(routingId, 0, this, 11, 3)
-            this[14] = 0x00
-            this[15] = 0x00
+            this[14] = (domainId and 0xFF).toByte()
+            this[15] = ((domainId shr 8) and 0xFF).toByte()
         }
         return seed.copyOf()
     }

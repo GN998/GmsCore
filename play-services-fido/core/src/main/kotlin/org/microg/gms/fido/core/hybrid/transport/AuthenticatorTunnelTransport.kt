@@ -21,7 +21,7 @@ class AuthenticatorTunnelTransport(val tunnelId: ByteArray, val callback: Tunnel
 
     fun startConnecting() {
         Log.d(TAG, "startConnecting: ")
-        val webSocketConnectUrl = buildWebSocketNewUrl(tunnelId)
+        val webSocketConnectUrl = buildWebSocketNewUrl(tunnelId, 267)
         Log.d(TAG, "startConnecting: webSocketConnectUrl=$webSocketConnectUrl")
         if (websocket == null) {
             websocket = TunnelWebsocket(webSocketConnectUrl, this)
